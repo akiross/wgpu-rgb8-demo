@@ -4,6 +4,8 @@ use winit::{
     window::Window,
 };
 
+use std::time::{Duration, Instant};
+
 // Structure for a frame
 struct BgrFrame {
     height: usize,
@@ -11,6 +13,56 @@ struct BgrFrame {
     data: Vec<u8>,
 }
 
+struct Producer {
+    height: usize,
+    width: usize,
+    frame: usize,
+}
+
+impl Producer {
+    fn new_with_size(height: usize, width: usize) -> Self {
+        Producer{height, width, frame: 0}
+    }
+    fn next_frame(&mut self) -> BgrFrame {
+        let data = (0 .. self.height * self.width)
+            .flat_map(|i| {
+                // A pattern that changes in time
+                if self.frame % 2 == 0 {
+                    vec!(0xff as u8, 0x00 as u8, 0x00 as u8)
+                } else {
+                    vec!(0x00 as u8, 0x00 as u8, 0xff as u8)
+                }
+            }).collect();
+        let frame = BgrFrame {
+            height: self.height,
+            width: self.width,
+            data,
+        };
+        self.frame += 1;
+        return frame;
+    }
+}
+
+fn bgr2bgra(data: Vec<u8>) -> Vec<u8> {
+    let n_pix = data.len() / 3;
+    let mut bgra = Vec::with_capacity(4 * n_pix);
+    for i in 0 .. n_pix {
+        bgra.push(data[i * 3 + 0]);
+        bgra.push(data[i * 3 + 1]);
+        bgra.push(data[i * 3 + 2]);
+        bgra.push(1);
+    }
+    return bgra;
+}
+
+// This is painfully slow!! Why?
+/*
+fn bgr2bgra(data: Vec<u8>) -> Vec<u8> {
+    data.chunks(3).flat_map(|chunk| {
+        chunk.iter().map(u8::clone).chain(std::iter::once(1))
+    }).collect()
+}
+*/
 
 fn create_pattern(size: usize) -> Vec<u8> {
     use std::iter;
@@ -93,7 +145,10 @@ async fn run(evl: EventLoop<()>, win: Window) {
     });
 
     // Create the pattern
-    let image_data = create_pattern(256);
+    let mut producer = Producer::new_with_size(300, 400);
+    // let image_data = producer.next_frame().data;
+    let image_data = bgr2bgra(producer.next_frame().data);
+    // let image_data = create_pattern(256); //producer.next_frame();
     // Create texture of required size
     let texture_extent = wgpu::Extent3d {
         width: 256,
@@ -200,6 +255,14 @@ async fn run(evl: EventLoop<()>, win: Window) {
 
     let mut swap_chain = device.create_swap_chain(&surface, &sc_desc);
 
+    let mut count = 0;
+
+    let mut t_produce = Duration::new(0, 0);
+    let mut t_encode = Duration::new(0, 0);
+    let mut t_exec = Duration::new(0, 0);
+    let mut t_present = Duration::new(0, 0);
+    let mut now_present = Instant::now();
+
     evl.run(move |event, _, control_flow| {
         // Force ownership
         let _ = (
@@ -219,8 +282,35 @@ async fn run(evl: EventLoop<()>, win: Window) {
                 swap_chain = device.create_swap_chain(&surface, &sc_desc);
             }
             Event::RedrawRequested(_) => {
+                // Time since last now_present (end of frame encode)
+                t_present += now_present.elapsed();
+
+                // Get next frame
+                let now = Instant::now();
+                // let image_data = producer.next_frame().data;
+                let image_data = bgr2bgra(producer.next_frame().data);
+                t_produce += now.elapsed();
+
+                let now = Instant::now();
+                let temp_buff = device.create_buffer_with_data(image_data.as_slice(), wgpu::BufferUsage::COPY_SRC);
+
                 let frame = swap_chain.get_next_texture().expect("Timeout when acquiring next swap chain texture");
                 let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {label: None});
+                encoder.copy_buffer_to_texture(
+                    wgpu::BufferCopyView {
+                        buffer: &temp_buff,
+                        offset: 0,
+                        bytes_per_row: 4 * 256,
+                        rows_per_image: 0,
+                    },
+                    wgpu::TextureCopyView {
+                        texture: &texture,
+                        mip_level: 0,
+                        array_layer: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                    },
+                    texture_extent,
+                );
                 {
                     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         color_attachments: &[wgpu::RenderPassColorAttachmentDescriptor {
@@ -236,7 +326,26 @@ async fn run(evl: EventLoop<()>, win: Window) {
                     rpass.set_bind_group(0, &bind_group, &[]);
                     rpass.draw(0..4, 0..1);
                 }
+                t_encode += now.elapsed();
+                let now = Instant::now();
                 queue.submit(&[encoder.finish()]);
+                t_exec += now.elapsed();
+                
+                // Measure time for next present
+                now_present = Instant::now();
+
+                count += 1;
+                if count % 50 == 0 {
+                    println!("Frame count {}", count);
+                    println!("  t_produce: {}s", t_produce.as_secs());
+                    println!("  t_encode: {}s", t_encode.as_secs());
+                    println!("  t_exec: {}s", t_exec.as_secs());
+                    println!("  t_present: {}s", t_exec.as_secs());
+                    t_produce = Duration::new(0, 0);
+                    t_encode = Duration::new(0, 0);
+                    t_exec = Duration::new(0, 0);
+                    t_present = Duration::new(0, 0);
+                }
             }
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
             _ => {}
