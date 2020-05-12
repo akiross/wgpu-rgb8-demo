@@ -92,9 +92,6 @@ async fn run(evl: EventLoop<()>, win: Window) {
         bind_group_layouts: &[&bind_group_layout],
     });
 
-    // Init encoder is used to write to texture
-    let mut init_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
     // Create the pattern
     let image_data = create_pattern(256);
     // Create texture of required size
@@ -115,6 +112,7 @@ async fn run(evl: EventLoop<()>, win: Window) {
     });
     let texture_view = texture.create_default_view();
     // Copy texture 
+    let mut init_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     let temp_buff = device.create_buffer_with_data(image_data.as_slice(), wgpu::BufferUsage::COPY_SRC);
     init_encoder.copy_buffer_to_texture(
         wgpu::BufferCopyView {
@@ -131,7 +129,9 @@ async fn run(evl: EventLoop<()>, win: Window) {
         },
         texture_extent,
     );
+    queue.submit(&[init_encoder.finish()]);
 
+    // Create a sampler to access texture data
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
