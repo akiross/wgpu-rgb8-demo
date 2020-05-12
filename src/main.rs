@@ -26,11 +26,13 @@ impl Producer {
     fn next_frame(&mut self) -> BgrFrame {
         let data = (0 .. self.height * self.width)
             .flat_map(|i| {
-                // A pattern that changes in time
-                if self.frame % 2 == 0 {
-                    vec!(0xff as u8, 0x00 as u8, 0x00 as u8)
+                let x = i % self.width;
+                let y = i / self.width;
+                let col = (255.0 * (y as f32 / self.height as f32)) as u8 * (self.frame % 2) as u8;
+                if ((x / 10) % 2) ^ ((y / 10) % 2) == 0 {
+                    vec!(col as u8, 0x00 as u8, 0x00 as u8) // Blue
                 } else {
-                    vec!(0x00 as u8, 0x00 as u8, 0xff as u8)
+                    vec!(0x00 as u8, 0x00 as u8, col as u8)
                 }
             }).collect();
         let frame = BgrFrame {
@@ -145,14 +147,16 @@ async fn run(evl: EventLoop<()>, win: Window) {
     });
 
     // Create the pattern
-    let mut producer = Producer::new_with_size(300, 400);
+    const H: usize = 300;
+    const W: usize = 400;
+    let mut producer = Producer::new_with_size(H, W);
     // let image_data = producer.next_frame().data;
     let image_data = bgr2bgra(producer.next_frame().data);
     // let image_data = create_pattern(256); //producer.next_frame();
     // Create texture of required size
     let texture_extent = wgpu::Extent3d {
-        width: 256,
-        height: 256,
+        width: W as u32,
+        height: H as u32,
         depth: 1,
     };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -173,7 +177,7 @@ async fn run(evl: EventLoop<()>, win: Window) {
         wgpu::BufferCopyView {
             buffer: &temp_buff,
             offset: 0,
-            bytes_per_row: 4 * 256,
+            bytes_per_row: 4 * W as u32,
             rows_per_image: 0,
         },
         wgpu::TextureCopyView {
@@ -300,7 +304,7 @@ async fn run(evl: EventLoop<()>, win: Window) {
                     wgpu::BufferCopyView {
                         buffer: &temp_buff,
                         offset: 0,
-                        bytes_per_row: 4 * 256,
+                        bytes_per_row: 4 * W as u32,
                         rows_per_image: 0,
                     },
                     wgpu::TextureCopyView {

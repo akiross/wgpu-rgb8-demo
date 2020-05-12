@@ -35,6 +35,6 @@ void main() {
     }
     */
     vec2 position = vec2(gl_VertexIndex & 1, gl_VertexIndex / 2);
-    v_TexCoord = position;
+    v_TexCoord = vec2(position.x, 1.0 - position.y);
     gl_Position = vec4(2.0 * d * position - d, 0.0, 1.0);
 }
