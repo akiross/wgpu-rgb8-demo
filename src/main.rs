@@ -4,6 +4,8 @@ use winit::{
     window::Window,
 };
 
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 // Structure for a frame
@@ -21,20 +23,25 @@ struct Producer {
 
 impl Producer {
     fn new_with_size(height: usize, width: usize) -> Self {
-        Producer{height, width, frame: 0}
+        Producer {
+            height,
+            width,
+            frame: 0,
+        }
     }
     fn next_frame(&mut self) -> BgrFrame {
-        let data = (0 .. self.height * self.width)
+        let data = (0..self.height * self.width)
             .flat_map(|i| {
                 let x = i % self.width;
                 let y = i / self.width;
                 let col = (255.0 * (y as f32 / self.height as f32)) as u8 * (self.frame % 2) as u8;
                 if ((x / 10) % 2) ^ ((y / 10) % 2) == 0 {
-                    vec!(col as u8, 0x00 as u8, 0x00 as u8) // Blue
+                    vec![col as u8, 0x00 as u8, 0x00 as u8] // Blue
                 } else {
-                    vec!(0x00 as u8, 0x00 as u8, col as u8)
+                    vec![0x00 as u8, 0x00 as u8, col as u8]
                 }
-            }).collect();
+            })
+            .collect();
         let frame = BgrFrame {
             height: self.height,
             width: self.width,
@@ -45,16 +52,14 @@ impl Producer {
     }
 }
 
-fn bgr2bgra(data: Vec<u8>) -> Vec<u8> {
+fn bgr2bgra(data: Vec<u8>, dest: &mut [u8]) {
     let n_pix = data.len() / 3;
-    let mut bgra = Vec::with_capacity(4 * n_pix);
-    for i in 0 .. n_pix {
-        bgra.push(data[i * 3 + 0]);
-        bgra.push(data[i * 3 + 1]);
-        bgra.push(data[i * 3 + 2]);
-        bgra.push(1);
+    for i in 0..n_pix {
+        dest[i * 4 + 0] = data[i * 3 + 0];
+        dest[i * 4 + 1] = data[i * 3 + 1];
+        dest[i * 4 + 2] = data[i * 3 + 2];
+        dest[i * 4 + 3] = 1;
     }
-    return bgra;
 }
 
 // This is painfully slow!! Why?
@@ -66,9 +71,57 @@ fn bgr2bgra(data: Vec<u8>) -> Vec<u8> {
 }
 */
 
+// SyncWriteBuffer32, actually...
+struct SyncBuffer {
+    buf: wgpu::Buffer,
+    width: usize,
+    height: usize,
+}
+
+impl SyncBuffer {
+    fn create(
+        device: &wgpu::Device,
+        width: usize,
+        height: usize,
+        usage: wgpu::BufferUsage,
+    ) -> Self {
+        let mb = SyncBuffer {
+            buf: device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: (width * height * 4) as u64,
+                usage,
+            }),
+            width,
+            height,
+        };
+        return mb;
+    }
+
+    fn map_write(&self) -> wgpu::BufferWriteMapping {
+        let size = self.width * self.height * 4;
+        let buf = &self.buf;
+        // Start thread to wait
+        let (tx, rx) = mpsc::channel();
+        //let (ty, ry) = mpsc::channel();
+        //ty.send(self.buf).unwrap();
+        thread::spawn(move || {
+            //let buf = ry.recv().unwrap();
+            let map_future = buf.map_write(0, size as u64);
+            let data = futures::executor::block_on(map_future).unwrap();
+            tx.send(data).unwrap();
+        });
+        rx.recv().unwrap()
+    }
+    fn unmap(&self) {
+        self.buf.unmap();
+    }
+}
+
 async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
-    // Why 'static lifetime was necessary?
-    where F: FnMut() -> BgrFrame + 'static {
+// Why 'static lifetime was necessary?
+where
+    F: FnMut() -> BgrFrame + 'static,
+{
     let size = win.inner_size();
     /* from master branch
     let instance = wgpu::Instance::new();
@@ -83,27 +136,34 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
             compatible_surface: Some(&surface),
         },
         wgpu::BackendBit::PRIMARY,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
-    let (device, queue) = adapter.request_device(
-        &wgpu::DeviceDescriptor {
-            extensions: wgpu::Extensions {
-                anisotropic_filtering: false,
+    let (device, queue) = adapter
+        .request_device(
+            &wgpu::DeviceDescriptor {
+                extensions: wgpu::Extensions {
+                    anisotropic_filtering: false,
+                },
+                limits: wgpu::Limits::default(),
             },
-            limits: wgpu::Limits::default()
-        },
-        // None,
-    ).await; //.unwrap();
+            // None,
+        )
+        .await; //.unwrap();
 
     let vs = include_bytes!("shader.vert.spv");
-    let vs_module = device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs[..])).unwrap());
+    let vs_module =
+        device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs[..])).unwrap());
 
     let fs = include_bytes!("shader.frag.spv");
-    let fs_module = device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs[..])).unwrap());
+    let fs_module =
+        device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs[..])).unwrap());
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         bindings: &[
-            wgpu::BindGroupLayoutEntry { // Accessing texture in frag
+            wgpu::BindGroupLayoutEntry {
+                // Accessing texture in frag
                 binding: 0,
                 visibility: wgpu::ShaderStage::FRAGMENT,
                 ty: wgpu::BindingType::SampledTexture {
@@ -112,7 +172,8 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
                     dimension: wgpu::TextureViewDimension::D2,
                 },
             },
-            wgpu::BindGroupLayoutEntry { // Sampling texture in frag
+            wgpu::BindGroupLayoutEntry {
+                // Sampling texture in frag
                 binding: 1,
                 visibility: wgpu::ShaderStage::FRAGMENT,
                 ty: wgpu::BindingType::Sampler { comparison: false },
@@ -128,7 +189,6 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
     let frame = next_frame();
     let width = frame.width;
     let height = frame.height;
-    let image_data = bgr2bgra(frame.data);
     // Create texture of required size
     let texture_extent = wgpu::Extent3d {
         width: width as u32,
@@ -146,12 +206,26 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
         usage: wgpu::TextureUsage::SAMPLED | wgpu::TextureUsage::COPY_DST,
     });
     let texture_view = texture.create_default_view();
-    // Copy texture 
-    let mut init_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-    let temp_buff = device.create_buffer_with_data(image_data.as_slice(), wgpu::BufferUsage::COPY_SRC);
+    // Copy texture
+    // Create a buffer to store image data on GPU
+    let sync_buff = SyncBuffer::create(
+        &device,
+        width,
+        height,
+        wgpu::BufferUsage::COPY_SRC | wgpu::BufferUsage::MAP_WRITE,
+    );
+    let mapped_image_buff = sync_buff.map_write();
+    bgr2bgra(frame.data, mapped_image_buff.as_slice());
+    //mapped_image_buff.data.copy_from_slice(image_data.as_slice());
+    // let image_buff = mapped_image_buff.finish();
+    sync_buff.unmap();
+
+    // Copy data from buffer to texture
+    let mut init_encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
     init_encoder.copy_buffer_to_texture(
         wgpu::BufferCopyView {
-            buffer: &temp_buff,
+            buffer: &sync_buff.buf,
             offset: 0,
             bytes_per_row: 4 * width as u32,
             rows_per_image: 0,
@@ -199,8 +273,14 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         layout: &pipeline_layout,
-        vertex_stage: wgpu::ProgrammableStageDescriptor { module: &vs_module, entry_point: "main", },
-        fragment_stage: Some(wgpu::ProgrammableStageDescriptor { module: &fs_module, entry_point: "main" }),
+        vertex_stage: wgpu::ProgrammableStageDescriptor {
+            module: &vs_module,
+            entry_point: "main",
+        },
+        fragment_stage: Some(wgpu::ProgrammableStageDescriptor {
+            module: &fs_module,
+            entry_point: "main",
+        }),
         rasterization_state: Some(wgpu::RasterizationStateDescriptor {
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: wgpu::CullMode::None,
@@ -256,7 +336,10 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
         match event {
             Event::MainEventsCleared => win.request_redraw(),
             // Resize events must rebuild the swap chain
-            Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
+            Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } => {
                 sc_desc.width = size.width;
                 sc_desc.height = size.height;
                 swap_chain = device.create_swap_chain(&surface, &sc_desc);
@@ -265,19 +348,28 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
                 // Time since last now_present (end of frame encode)
                 t_present += now_present.elapsed();
 
-                // Get next frame
                 let now = Instant::now();
-                let image_data = bgr2bgra(next_frame().data);
+                // Map buffer for writing
+                //let mapped_image_buff = image_buff.map_write(0, (width * height * 4) as u64);
+                // Get next frame
+                // let mut image_data = futures::executor::block_on(mapped_image_buff).unwrap();
+                let mapped_image_buff = sync_buff.map_write();
+                bgr2bgra(next_frame().data, mapped_image_buff.as_slice());
+                // Copy from CPU to GPU
+                //image_buff.unmap();
+                sync_buff.unmap();
                 t_produce += now.elapsed();
 
-                let now = Instant::now();
-                let temp_buff = device.create_buffer_with_data(image_data.as_slice(), wgpu::BufferUsage::COPY_SRC);
+                //let temp_buff = device.create_buffer_with_data(image_data.as_slice(), wgpu::BufferUsage::COPY_SRC);
 
-                let frame = swap_chain.get_next_texture().expect("Timeout when acquiring next swap chain texture");
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {label: None});
+                let frame = swap_chain
+                    .get_next_texture()
+                    .expect("Timeout when acquiring next swap chain texture");
+                let mut encoder =
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
                 encoder.copy_buffer_to_texture(
                     wgpu::BufferCopyView {
-                        buffer: &temp_buff,
+                        buffer: &sync_buff.buf,
                         offset: 0,
                         bytes_per_row: 4 * width as u32,
                         rows_per_image: 0,
@@ -309,7 +401,7 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
                 let now = Instant::now();
                 queue.submit(&[encoder.finish()]);
                 t_exec += now.elapsed();
-                
+
                 // Measure time for next present
                 now_present = Instant::now();
 
@@ -326,12 +418,14 @@ async fn run<F>(evl: EventLoop<()>, win: Window, mut next_frame: F)
                     t_present = Duration::new(0, 0);
                 }
             }
-            Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => *control_flow = ControlFlow::Exit,
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => *control_flow = ControlFlow::Exit,
             _ => {}
         }
     });
 }
-
 
 fn main() {
     let evl = EventLoop::new();
@@ -339,5 +433,5 @@ fn main() {
     env_logger::init();
     let mut producer = Producer::new_with_size(300, 400);
 
-    futures::executor::block_on(run(evl, win, move || { producer.next_frame() }));
+    futures::executor::block_on(run(evl, win, move || producer.next_frame()));
 }
