@@ -14,6 +14,17 @@ pub fn bgr2bgra(data: &[u8]) -> Vec<u8> {
     return bgra;
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("Unable to access adapter")]
+    NoAdapter,
+    #[error("Swap chain timed out while acquiring next texture")]
+    SwapChainTimeout(wgpu::TimeOut),
+    #[error("Unable to load shader")]
+    ShaderLoad(#[source] std::io::Error),
+}
+
+/// Stores the state of the wgpu renderer
 pub struct Renderer {
     img_w: usize,
     surface: wgpu::Surface,
@@ -32,26 +43,37 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(win: &Window, img_w: usize, img_h: usize) -> Self {
+    /// Creates new renderer for an image of size img_w, img_h on the given window
+    pub fn new(win: &Window, img_w: usize, img_h: usize) -> Result<Self, Error> {
         let size = win.inner_size();
         let surface = wgpu::Surface::create(win);
 
-        let (adapter, device, queue) = Self::setup_adapter_device_queue(&surface);
+        // The first step in using wgpu is to have an adapter, which describes
+        // the hardware and implementation capabilities. The device and the queue
+        // are instead operational, and they allow to perform render and computer.
+        let (adapter, device, queue) = Self::setup_adapter_device_queue(&surface)?;
+        // This format is supported by every platform
         let sc_format = wgpu::TextureFormat::Bgra8UnormSrgb;
+        // The swap chain is a set of framebuffers used as (screen) render target.
         let (sc_desc, swap_chain) = Self::setup_swap_chain(&device, size, &surface, sc_format);
-        let (bind_group_layout, render_pipeline) = Self::setup_pipeline(&device, sc_format);
-
+        // Then a pipeline is set up: it is a description of a set of steps that will
+        // transform data into an image; to do so, a description of how data are layed out
+        // is necessary: that's the bind group layout.
+        let (bind_group_layout, render_pipeline) = Self::setup_pipeline(&device, sc_format)?;
+        // Then we allocate the actual data: a texture (memory region) and a sampler (a
+        // resource that allows to retrieve values from a texture).
         let (texture_extent, texture, sampler) = Self::setup_texture(&device, img_w, img_h);
-
         let texture_view = texture.create_default_view();
-
+        // The bind group is then created: this is an actual set of resources (texture and
+        // sampler), that are addressable according to their bind group layout. The
+        // driver will take care of optimizing the placement of these resources according
+        // to the usage described by the layout. The pipeline will use the bind group
+        // layout to access the bind group (resources) efficiently.
         let bind_group =
             Self::setup_bind_group(&device, &bind_group_layout, &texture_view, &sampler);
 
-        Renderer {
+        Ok(Renderer {
             img_w,
-            //img_h,
-            //size,
             surface,
             adapter,
             device,
@@ -63,22 +85,22 @@ impl Renderer {
             texture,
             texture_extent,
             bind_group,
-        }
+        })
     }
 
+    /// Creates the swap chain, that is framebuffers required to show things on screen
     fn setup_swap_chain(
         device: &wgpu::Device,
         size: winit::dpi::PhysicalSize<u32>,
         surface: &wgpu::Surface,
         sc_format: wgpu::TextureFormat,
     ) -> (wgpu::SwapChainDescriptor, wgpu::SwapChain) {
-        // Setup the swap chain
         let sc_desc = wgpu::SwapChainDescriptor {
             usage: wgpu::TextureUsage::OUTPUT_ATTACHMENT,
             format: sc_format,
             width: size.width,
             height: size.height,
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Mailbox, // low latency v-synced display
         };
 
         let swap_chain = device.create_swap_chain(surface, &sc_desc);
@@ -86,9 +108,10 @@ impl Renderer {
         (sc_desc, swap_chain)
     }
 
+    /// Sync function to retrieve adater, device and default device queue
     fn setup_adapter_device_queue(
         surface: &wgpu::Surface,
-    ) -> (wgpu::Adapter, wgpu::Device, wgpu::Queue) {
+    ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), Error> {
         let adapter = executor::block_on(async {
             wgpu::Adapter::request(
                 &wgpu::RequestAdapterOptions {
@@ -98,32 +121,31 @@ impl Renderer {
                 wgpu::BackendBit::PRIMARY,
             )
             .await
-            .expect("Unable to request adapter")
-        });
+            .ok_or(Error::NoAdapter)
+        })?;
 
         // Request device and default queue
         let (device, queue) = executor::block_on(async {
             adapter
-                .request_device(
+                .request_device( // Panics if no devices are found
                     &wgpu::DeviceDescriptor {
                         extensions: wgpu::Extensions {
                             anisotropic_filtering: false,
                         },
                         limits: wgpu::Limits::default(),
                     },
-                    // None,
                 )
-                .await //.unwrap();
+                .await
         });
-        (adapter, device, queue)
+        Ok((adapter, device, queue))
     }
 
+    /// Creates texture buffer on the GPU and a sampler to read it from shaders
     fn setup_texture(
         device: &wgpu::Device,
         width: usize,
         height: usize,
     ) -> (wgpu::Extent3d, wgpu::Texture, wgpu::Sampler) {
-        // let image_data = frame;
         // Create texture of required size
         let texture_extent = wgpu::Extent3d {
             width: width as u32,
@@ -156,6 +178,7 @@ impl Renderer {
         (texture_extent, texture, sampler)
     }
 
+    /// Creates a bind group for texture access
     fn setup_bind_group(
         device: &wgpu::Device,
         bind_group_layout: &wgpu::BindGroupLayout,
@@ -179,18 +202,19 @@ impl Renderer {
         })
     }
 
+    /// Creates a pipeline that displays the image on a quad texture
     fn setup_pipeline(
         device: &wgpu::Device,
         sc_format: wgpu::TextureFormat,
-    ) -> (wgpu::BindGroupLayout, wgpu::RenderPipeline) {
-        // Shader modules are just sampling texels and drawing to a fixed quad
-        let vs = include_bytes!("../shaders/shader.vert.spv");
+    ) -> Result<(wgpu::BindGroupLayout, wgpu::RenderPipeline), Error> {
+        // Shader modules are just sampling textures and drawing to a fixed quad
+        let vs = include_bytes!(concat!(env!("OUT_DIR"), "/shader.vert.spv"));
         let vs_module =
-            device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs[..])).unwrap());
+            device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&vs[..])).map_err(Error::ShaderLoad)?);
 
-        let fs = include_bytes!("../shaders/shader.frag.spv");
+        let fs = include_bytes!(concat!(env!("OUT_DIR"), "/shader.frag.spv"));
         let fs_module =
-            device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs[..])).unwrap());
+            device.create_shader_module(&wgpu::read_spirv(std::io::Cursor::new(&fs[..])).map_err(Error::ShaderLoad)?);
 
         // Bind 0 is used for texture and 1 is used for sampler
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -252,24 +276,26 @@ impl Renderer {
             sample_mask: !0,
             alpha_to_coverage_enabled: false,
         });
-        (bind_group_layout, pipeline)
+        Ok((bind_group_layout, pipeline))
     }
 
+    /// Handles resize by recreating the swap chain (framebuffers)
     pub fn resize(&mut self, width: u32, height: u32) {
         self.sc_desc.width = width;
         self.sc_desc.height = height;
         self.swap_chain = self.device.create_swap_chain(&self.surface, &self.sc_desc);
     }
 
-    pub fn render(&mut self, image_data: &[u8]) -> () {
+    /// Presents BGRA8 bgra8_data sending it to texture buffer and rendering the frame
+    pub fn render(&mut self, bgra8_data: &[u8]) -> Result<(), Error> {
         let temp_buff = self
             .device
-            .create_buffer_with_data(image_data, wgpu::BufferUsage::COPY_SRC);
+            .create_buffer_with_data(bgra8_data, wgpu::BufferUsage::COPY_SRC);
 
         let frame = self
             .swap_chain
             .get_next_texture()
-            .expect("Timeout when acquiring next swap chain texture");
+            .map_err(Error::SwapChainTimeout)?;
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -305,5 +331,6 @@ impl Renderer {
             rpass.draw(0..4, 0..1);
         }
         self.queue.submit(&[encoder.finish()]);
+        Ok(())
     }
 }

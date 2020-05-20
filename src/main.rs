@@ -62,7 +62,8 @@ fn main() {
 
     let evl = EventLoop::new();
     let win = Window::new(&evl).unwrap();
-    let mut rend = wgpu_rgb8_demo::Renderer::new(&win, WIDTH, HEIGHT);
+    let mut rend = wgpu_rgb8_demo::Renderer::new(&win, WIDTH, HEIGHT)
+        .expect("Couldn't initialize the renderer");
 
     evl.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -77,7 +78,8 @@ fn main() {
                 rend.resize(size.width, size.height);
             }
             Event::RedrawRequested(_) => {
-                rend.render(wgpu_rgb8_demo::bgr2bgra(producer.next_frame().as_slice()).as_slice());
+                rend.render(wgpu_rgb8_demo::bgr2bgra(producer.next_frame().as_slice()).as_slice())
+                    .expect("Couldn't render");
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
